@@ -4,6 +4,7 @@
 # Description: X5Shrink 是一个用于压缩 RDK X5 系统镜像的脚本，
 #              针对 RDK X5 的双分区结构 (FAT32 config + ext4 rootfs) 进行适配。
 #              压缩后的镜像在首次启动时会自动扩展到 SD 卡的最大容量。
+# Link: https://github.com/AIResearcherHZ/x5shrink
 
 version="v1.0.0"
 
