@@ -133,19 +133,16 @@ do_expand_rootfs() {
     PART_START=$(parted "$DEVICE" -ms unit s p | grep "^${PART_NUM}" | cut -f 2 -d: | sed 's/[^0-9]//g')
     [ -z "$PART_START" ] && return 1
 
-    # 使用 fdisk 扩展分区
-    fdisk "$DEVICE" <<EOF
-p
-d
-$PART_NUM
-n
-p
-$PART_NUM
-$PART_START
+    # 获取磁盘总扇区数并计算结束扇区 (留1MB对齐)
+    DISK_SIZE=$(blockdev --getsz "$DEVICE")
+    # 对齐到2048扇区 (1MB边界)
+    END_SECTOR=$(( (DISK_SIZE / 2048) * 2048 - 1 ))
 
-p
-w
-EOF
+    # 使用 parted 扩展分区 (比fdisk更可靠)
+    echo "正在扩展分区 $PART_NUM 从扇区 $PART_START 到 $END_SECTOR ..."
+    parted -s "$DEVICE" rm "$PART_NUM"
+    parted -s "$DEVICE" unit s mkpart primary ext4 "${PART_START}s" "${END_SECTOR}s"
+    parted -s "$DEVICE" set "$PART_NUM" boot on
 
     # 创建第二阶段扩展脚本
     cat <<'EOF2' > /etc/init.d/x5-autoexpand-phase2
@@ -394,10 +391,10 @@ logVariables $LINENO currentsize minsize
 if [[ $currentsize -eq $minsize ]]; then
     info "文件系统已经是最小尺寸，跳过文件系统压缩"
 else
-    # 在文件系统末尾添加一些空闲空间
+    # 在文件系统末尾添加一些空闲空间 (减少预留空间以获得更小的镜像)
     extra_space=$(($currentsize - $minsize))
     logVariables $LINENO extra_space
-    for space in 5000 1000 100; do
+    for space in 2500 500 50; do
         if [[ $extra_space -gt $space ]]; then
             minsize=$(($minsize + $space))
             break
@@ -460,14 +457,17 @@ else
 
     # 截断文件
     info "正在截断镜像文件"
-    endresult=$(parted -ms "$img" unit B print free)
+    parted_output=$(parted -ms "$img" unit B print)
     rc=$?
     if (( $rc )); then
         error $LINENO "parted 执行失败，返回码 $rc"
         exit 15
     fi
 
-    endresult=$(tail -1 <<< "$endresult" | cut -d ':' -f 2 | tr -d 'B')
+    # 获取 rootfs 分区 (第2分区) 的结束位置，而不是 free space
+    endresult=$(echo "$parted_output" | grep "^${rootfs_partnum}:" | cut -d ':' -f 3 | tr -d 'B')
+    # 加1字节作为文件大小
+    endresult=$((endresult + 1))
     logVariables $LINENO endresult
     truncate -s "$endresult" "$img"
     rc=$?
