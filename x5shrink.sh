@@ -9,8 +9,6 @@
 #
 # Link: https://github.com/AIResearcherHZ/x5shrink
 
-set -euo pipefail
-
 readonly VERSION="v1.0.0"
 readonly SCRIPT_NAME="${0##*/}"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -108,7 +106,10 @@ get_partition_info() {
 
 setup_loopback() {
     local img="$1" offset="$2"
-    loopback=$(losetup -f --show -o "$offset" "$img") || die "无法创建 loopback 设备"
+    loopback=$(losetup -f --show -o "$offset" "$img")
+    if [[ -z "$loopback" ]]; then
+        die "无法创建 loopback 设备"
+    fi
     debug_log "创建 loopback: $loopback (offset=$offset)"
 }
 
@@ -120,16 +121,21 @@ release_loopback() {
 }
 
 check_filesystem() {
-    info "检查文件系统..."
-    
-    if ! e2fsck -pf "$loopback"; then
-        warn "检测到文件系统错误，尝试修复..."
-        e2fsck -y "$loopback" || {
-            [[ "$repair" == true ]] && e2fsck -fy -b 32768 "$loopback"
-        }
+    info "检查文件系统"
+    e2fsck -pf "$loopback"
+    (( $? < 4 )) && return
+
+    info "检测到文件系统错误!"
+    info "尝试修复损坏的文件系统"
+    e2fsck -y "$loopback"
+    (( $? < 4 )) && return
+
+    if [[ $repair == true ]]; then
+        info "尝试修复损坏的文件系统 - 第二阶段"
+        e2fsck -fy -b 32768 "$loopback"
+        (( $? < 4 )) && return
     fi
-    
-    (( $? < 4 )) || die "文件系统修复失败"
+    die "文件系统修复失败"
 }
 
 get_fs_info() {
@@ -192,12 +198,16 @@ shrink_partition() {
     # 删除并重建分区
     parted -s -a minimal "$img" rm 2 || die "删除分区失败"
     parted -s "$img" unit B mkpart primary ext4 "$rootfs_start" "$new_end" || die "创建分区失败"
-    parted -s "$img" set 2 boot on
+    parted -s "$img" set 2 boot on || true
     
     # 验证文件系统
     setup_loopback "$img" "$rootfs_start"
     info "验证压缩后的文件系统..."
-    e2fsck -fy "$loopback" || (( $? < 4 )) || die "文件系统验证失败"
+    e2fsck -fy "$loopback"
+    local rc=$?
+    if (( rc >= 4 )); then
+        die "文件系统验证失败 (返回码: $rc)"
+    fi
     release_loopback
 }
 
@@ -378,7 +388,6 @@ main() {
     setup_loopback "$img" "$rootfs_start"
     get_fs_info
     setup_autoexpand
-    
     setup_loopback "$img" "$rootfs_start"
     check_filesystem
     calculate_min_size
