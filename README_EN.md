@@ -339,12 +339,6 @@ Welcome to submit Issues and Pull Requests!
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details
 
-## Acknowledgments
-
-- Thanks to [PiShrink](https://github.com/Drewsif/PiShrink) project for inspiration and reference
-- Thanks to D-Robotics team for developing the RDK X5 development board
-- Thanks to all contributors and users for their support
-
 ## Contact
 
 - **Author**: AIResearcherHZ
