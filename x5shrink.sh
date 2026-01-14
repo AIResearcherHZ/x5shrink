@@ -133,16 +133,19 @@ do_expand_rootfs() {
     PART_START=$(parted "$DEVICE" -ms unit s p | grep "^${PART_NUM}" | cut -f 2 -d: | sed 's/[^0-9]//g')
     [ -z "$PART_START" ] && return 1
 
-    # 获取磁盘总扇区数并计算结束扇区 (留1MB对齐)
-    DISK_SIZE=$(blockdev --getsz "$DEVICE")
-    # 对齐到2048扇区 (1MB边界)
-    END_SECTOR=$(( (DISK_SIZE / 2048) * 2048 - 1 ))
+    # 使用 fdisk 扩展分区
+    fdisk "$DEVICE" <<EOF
+p
+d
+$PART_NUM
+n
+p
+$PART_NUM
+$PART_START
 
-    # 使用 parted 扩展分区 (比fdisk更可靠)
-    echo "正在扩展分区 $PART_NUM 从扇区 $PART_START 到 $END_SECTOR ..."
-    parted -s "$DEVICE" rm "$PART_NUM"
-    parted -s "$DEVICE" unit s mkpart primary ext4 "${PART_START}s" "${END_SECTOR}s"
-    parted -s "$DEVICE" set "$PART_NUM" boot on
+p
+w
+EOF
 
     # 创建第二阶段扩展脚本
     cat <<'EOF2' > /etc/init.d/x5-autoexpand-phase2
@@ -436,6 +439,11 @@ else
     newpartend=$(($rootfs_partstart + $partnewsize))
     logVariables $LINENO partnewsize newpartend
 
+    # 释放当前的 loopback 设备
+    losetup -d "$loopback"
+    loopback=""
+    sleep 1
+
     # 删除旧的 rootfs 分区
     parted -s -a minimal "$img" rm "$rootfs_partnum"
     rc=$?
@@ -454,6 +462,29 @@ else
 
     # 设置启动标志
     parted -s "$img" set "$rootfs_partnum" boot on
+
+    # 同步分区表更改
+    info "正在同步分区表"
+    partprobe "$img" 2>/dev/null || true
+    sleep 2
+
+    # 重新绑定 loopback 设备到新的 rootfs 分区
+    loopback="$(losetup -f --show -o "$rootfs_partstart" "$img")"
+    if [ -z "$loopback" ]; then
+        error $LINENO "无法重新绑定 loopback 设备"
+        exit 20
+    fi
+
+    # 对压缩后的文件系统进行完整性检查
+    info "正在检查压缩后的文件系统"
+    e2fsck -fy "$loopback"
+    rc=$?
+    if (( $rc > 1 && $rc < 4 )); then
+        info "文件系统检查完成，发现并修复了一些问题"
+    elif (( $rc >= 4 )); then
+        error $LINENO "文件系统检查失败，返回码 $rc"
+        exit 21
+    fi
 
     # 截断文件
     info "正在截断镜像文件"
@@ -478,8 +509,14 @@ else
 fi
 
 # 释放 loopback 设备
-losetup -d "$loopback" 2>/dev/null
-loopback=""
+if [ -n "${loopback:-}" ]; then
+    losetup -d "$loopback" 2>/dev/null
+    loopback=""
+fi
+
+# 最终同步确保所有更改写入磁盘
+sync
+sleep 1
 
 # 处理压缩
 if [[ -n $ziptool ]]; then
