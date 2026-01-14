@@ -1,551 +1,400 @@
 #!/usr/bin/env bash
-
-# Project: X5Shrink
-# Description: X5Shrink 是一个用于压缩 RDK X5 系统镜像的脚本，
-#              针对 RDK X5 的双分区结构 (FAT32 config + ext4 rootfs) 进行适配。
-#              压缩后的镜像在首次启动时会自动扩展到 SD 卡的最大容量。
+#
+# X5Shrink - RDK X5 镜像压缩工具
+# 
+# 功能：压缩 RDK X5 系统镜像，支持双分区结构 (FAT32 config + ext4 rootfs)
+#       压缩后的镜像在首次启动时通过 hobot-resizefs 自动扩展
+#
+# 用法：sudo ./x5shrink.sh [选项] <镜像文件> [输出文件]
+#
 # Link: https://github.com/AIResearcherHZ/x5shrink
 
-version="v1.0.0"
+set -euo pipefail
 
-CURRENT_DIR="$(pwd)"
-SCRIPTNAME="${0##*/}"
-MYNAME="${SCRIPTNAME%.*}"
-LOGFILE="${CURRENT_DIR}/${SCRIPTNAME%.*}.log"
-REQUIRED_TOOLS="parted losetup tune2fs md5sum e2fsck resize2fs"
-ZIPTOOLS=("gzip xz")
-declare -A ZIP_PARALLEL_TOOL=( [gzip]="pigz" [xz]="xz" )
-declare -A ZIP_PARALLEL_OPTIONS=( [gzip]="-f9" [xz]="-T0" )
-declare -A ZIPEXTENSIONS=( [gzip]="gz" [xz]="xz" )
+readonly VERSION="v1.0.0"
+readonly SCRIPT_NAME="${0##*/}"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-function info() {
-    echo "$SCRIPTNAME: $1"
-}
+# ============================================================================
+# 配置
+# ============================================================================
+readonly REQUIRED_TOOLS="parted losetup tune2fs e2fsck resize2fs"
+declare -A COMPRESS_TOOLS=([gzip]="pigz" [xz]="xz")
+declare -A COMPRESS_OPTS=([gzip]="-f9" [xz]="-T0")
+declare -A COMPRESS_EXT=([gzip]="gz" [xz]="xz")
 
-function error() {
-    echo -n "$SCRIPTNAME: 错误发生在第 $1 行: "
-    shift
-    echo "$@"
-}
-
-function cleanup() {
-    if [ -n "${loopback:-}" ] && losetup "$loopback" &>/dev/null; then
-        losetup -d "$loopback"
-    fi
-    if [ -n "${LOOP_DEV:-}" ] && losetup "$LOOP_DEV" &>/dev/null; then
-        losetup -d "$LOOP_DEV"
-    fi
-    if [ "$debug" = true ] && [ -n "${src:-}" ]; then
-        local old_owner=$(stat -c %u:%g "$src")
-        chown "$old_owner" "$LOGFILE"
-    fi
-}
-
-function logVariables() {
-    if [ "$debug" = true ]; then
-        echo "Line $1" >> "$LOGFILE"
-        shift
-        local v var
-        for var in "$@"; do
-            eval "v=\$$var"
-            echo "$var: $v" >> "$LOGFILE"
-        done
-    fi
-}
-
-function checkFilesystem() {
-    info "检查文件系统"
-    e2fsck -pf "$loopback"
-    (( $? < 4 )) && return
-
-    info "检测到文件系统错误!"
-
-    info "尝试修复损坏的文件系统"
-    e2fsck -y "$loopback"
-    (( $? < 4 )) && return
-
-    if [[ $repair == true ]]; then
-        info "尝试修复损坏的文件系统 - 第二阶段"
-        e2fsck -fy -b 32768 "$loopback"
-        (( $? < 4 )) && return
-    fi
-    error $LINENO "文件系统修复失败，放弃..."
-    exit 9
-}
-
-function set_autoexpand() {
-    # 在首次启动时自动扩展 rootfs
-    mountdir=$(mktemp -d)
-    partprobe "$loopback"
-    sleep 3
-    umount "$loopback" > /dev/null 2>&1
-    mount "$loopback" "$mountdir" -o rw
-    if (( $? != 0 )); then
-        info "无法挂载 loopback 设备，自动扩展功能将不会启用"
-        return
-    fi
-
-    if [ ! -d "$mountdir/etc" ]; then
-        info "未找到 /etc 目录，自动扩展功能将不会启用"
-        umount "$mountdir"
-        return
-    fi
-
-    # 检查是否已经存在自动扩展脚本
-    if [ -f "$mountdir/etc/init.d/x5-autoexpand" ]; then
-        info "自动扩展脚本已存在，跳过"
-        umount "$mountdir"
-        return
-    fi
-
-    info "创建 RDK X5 自动扩展脚本"
-
-    # 创建自动扩展脚本
-    cat <<'EOFEXPAND' > "$mountdir/etc/init.d/x5-autoexpand"
-#!/bin/bash
-### BEGIN INIT INFO
-# Provides:          x5-autoexpand
-# Required-Start:    $local_fs
-# Required-Stop:
-# Default-Start:     S
-# Default-Stop:
-# Short-Description: 自动扩展 RDK X5 rootfs 分区
-### END INIT INFO
-
-do_expand_rootfs() {
-    ROOT_PART=$(mount | sed -n 's|^/dev/\(.*\) on / .*|\1|p')
-    
-    # 检测设备类型 (mmcblk 或 sd)
-    if [[ "$ROOT_PART" == mmcblk* ]]; then
-        # eMMC/SD 卡设备
-        DEVICE="/dev/${ROOT_PART%p*}"
-        PART_NUM="${ROOT_PART##*p}"
-    elif [[ "$ROOT_PART" == sd* ]]; then
-        # SATA/USB 设备
-        DEVICE="/dev/${ROOT_PART%[0-9]*}"
-        PART_NUM="${ROOT_PART##*[a-z]}"
-    else
-        echo "无法识别的设备类型: $ROOT_PART"
-        return 1
-    fi
-
-    # 获取 rootfs 分区的起始扇区
-    PART_START=$(parted "$DEVICE" -ms unit s p | grep "^${PART_NUM}" | cut -f 2 -d: | sed 's/[^0-9]//g')
-    [ -z "$PART_START" ] && return 1
-
-    # 使用 fdisk 扩展分区
-    fdisk "$DEVICE" <<EOF
-p
-d
-$PART_NUM
-n
-p
-$PART_NUM
-$PART_START
-
-p
-w
-EOF
-
-    # 创建第二阶段扩展脚本
-    cat <<'EOF2' > /etc/init.d/x5-autoexpand-phase2
-#!/bin/bash
-### BEGIN INIT INFO
-# Provides:          x5-autoexpand-phase2
-# Required-Start:    $local_fs
-# Required-Stop:
-# Default-Start:     S
-# Default-Stop:
-# Short-Description: 扩展 RDK X5 rootfs 文件系统 (第二阶段)
-### END INIT INFO
-
-ROOT_PART=$(mount | sed -n 's|^/dev/\(.*\) on / .*|\1|p')
-echo "正在扩展文件系统 /dev/$ROOT_PART ..."
-resize2fs /dev/$ROOT_PART
-echo "文件系统扩展完成"
-
-# 清理自动扩展脚本
-update-rc.d x5-autoexpand-phase2 remove
-rm -f /etc/init.d/x5-autoexpand-phase2
-rm -f /etc/init.d/x5-autoexpand
-EOF2
-
-    chmod +x /etc/init.d/x5-autoexpand-phase2
-    update-rc.d x5-autoexpand-phase2 defaults
-
-    # 移除第一阶段脚本的自启动
-    update-rc.d x5-autoexpand remove
-
-    echo "分区扩展完成，正在重启以应用更改..."
-    reboot
-    exit
-}
-
-case "$1" in
-    start)
-        do_expand_rootfs
-        ;;
-    *)
-        echo "Usage: $0 start"
-        exit 1
-        ;;
-esac
-EOFEXPAND
-
-    chmod +x "$mountdir/etc/init.d/x5-autoexpand"
-    
-    # 启用自动扩展服务
-    chroot "$mountdir" /bin/bash -c "update-rc.d x5-autoexpand defaults" 2>/dev/null || \
-        ln -sf ../init.d/x5-autoexpand "$mountdir/etc/rcS.d/S01x5-autoexpand"
-
-    sync
-    umount "$mountdir"
-    info "自动扩展脚本已安装"
-}
-
-help() {
-    local help
-    read -r -d '' help << EOM
-用法: $0 [-adhnrsvzZ] imagefile.img [newimagefile.img]
-
-  -s         首次启动时不自动扩展文件系统
-  -v         显示详细信息
-  -r         如果普通修复失败，使用高级文件系统修复选项
-  -z         压缩后使用 gzip 压缩镜像
-  -Z         压缩后使用 xz 压缩镜像
-  -a         使用多核并行压缩
-  -d         将调试信息写入日志文件
-
-X5Shrink $version - 专为 RDK X5 设计的镜像压缩工具
-支持 RDK X5 的双分区结构 (FAT32 config 分区 + ext4 rootfs 分区)
-EOM
-    echo "$help"
-    exit 1
-}
-
-should_skip_autoexpand=false
+# ============================================================================
+# 全局变量
+# ============================================================================
+img=""
+loopback=""
+mountdir=""
 debug=false
 repair=false
 parallel=false
 verbose=false
+skip_autoexpand=false
 ziptool=""
 
-while getopts ":adhrsvzZ" opt; do
-    case "${opt}" in
-        a) parallel=true;;
-        d) debug=true;;
-        h) help;;
-        r) repair=true;;
-        s) should_skip_autoexpand=true ;;
-        v) verbose=true;;
-        z) ziptool="gzip";;
-        Z) ziptool="xz";;
-        *) help;;
-    esac
-done
-shift $((OPTIND-1))
+# ============================================================================
+# 工具函数
+# ============================================================================
+info()    { echo "$SCRIPT_NAME: $*"; }
+warn()    { echo "$SCRIPT_NAME: [警告] $*" >&2; }
+die()     { echo "$SCRIPT_NAME: [错误] $*" >&2; exit 1; }
+debug_log() { [[ "$debug" == true ]] && echo "[DEBUG] $*" >> "${SCRIPT_DIR}/${SCRIPT_NAME%.*}.log"; }
 
-if [ "$debug" = true ]; then
-    info "创建日志文件 $LOGFILE"
-    rm "$LOGFILE" &>/dev/null
-    exec 1> >(stdbuf -i0 -o0 -e0 tee -a "$LOGFILE" >&1)
-    exec 2> >(stdbuf -i0 -o0 -e0 tee -a "$LOGFILE" >&2)
-fi
+cleanup() {
+    [[ -n "${loopback:-}" ]] && losetup "$loopback" &>/dev/null && losetup -d "$loopback"
+    [[ -n "${mountdir:-}" ]] && mountpoint -q "$mountdir" 2>/dev/null && umount "$mountdir"
+    [[ -n "${mountdir:-}" ]] && [[ -d "$mountdir" ]] && rmdir "$mountdir" 2>/dev/null
+}
 
-echo -e "X5Shrink $version - RDK X5 镜像压缩工具\n"
+show_help() {
+    cat << EOF
+X5Shrink $VERSION - RDK X5 镜像压缩工具
 
-# 参数处理
-src="$1"
-img="$1"
+用法: sudo $SCRIPT_NAME [选项] <镜像文件> [输出文件]
 
-# 使用检查
-if [[ -z "$img" ]]; then
-    help
-fi
+选项:
+  -s    跳过自动扩展设置（首次启动时不自动扩展文件系统）
+  -r    使用高级文件系统修复选项
+  -z    压缩后使用 gzip 压缩镜像
+  -Z    压缩后使用 xz 压缩镜像
+  -a    使用多核并行压缩
+  -v    显示详细信息
+  -d    启用调试模式
+  -h    显示此帮助信息
 
-if [[ ! -f "$img" ]]; then
-    error $LINENO "$img 不是一个文件..."
-    exit 2
-fi
+示例:
+  sudo $SCRIPT_NAME rdk-x5.img                    # 压缩镜像
+  sudo $SCRIPT_NAME rdk-x5.img rdk-x5-shrink.img  # 压缩到新文件
+  sudo $SCRIPT_NAME -z rdk-x5.img                 # 压缩并gzip打包
 
-if (( EUID != 0 )); then
-    error $LINENO "需要 root 权限运行此脚本"
-    exit 3
-fi
+支持 RDK X5 双分区结构: FAT32 config 分区 + ext4 rootfs 分区
+EOF
+    exit 0
+}
 
-# 设置 POSIX 语言环境
-export LANGUAGE=POSIX
-export LC_ALL=POSIX
-export LANG=POSIX
+check_requirements() {
+    (( EUID == 0 )) || die "需要 root 权限运行此脚本"
+    
+    local tools="$REQUIRED_TOOLS"
+    [[ -n "$ziptool" ]] && tools+=" ${COMPRESS_TOOLS[$ziptool]:-$ziptool}"
+    
+    for cmd in $tools; do
+        command -v "$cmd" &>/dev/null || die "未找到必需工具: $cmd"
+    done
+}
 
-# 检查压缩工具
-if [[ -n $ziptool ]]; then
-    if [[ ! " ${ZIPTOOLS[@]} " =~ $ziptool ]]; then
-        error $LINENO "$ziptool 是不支持的压缩工具"
-        exit 17
-    else
-        if [[ $parallel == true && $ziptool == "gzip" ]]; then
-            REQUIRED_TOOLS="$REQUIRED_TOOLS pigz"
-        else
-            REQUIRED_TOOLS="$REQUIRED_TOOLS $ziptool"
-        fi
+# ============================================================================
+# 核心功能
+# ============================================================================
+get_partition_info() {
+    local img="$1"
+    
+    parted_output=$(parted -ms "$img" unit B print) || die "无法读取镜像分区表"
+    
+    local partcount=$(echo "$parted_output" | tail -n +3 | wc -l)
+    (( partcount >= 2 )) || die "镜像分区数量不正确，RDK X5 应有 2 个分区"
+    
+    # 解析 rootfs 分区 (第2分区)
+    rootfs_info=$(echo "$parted_output" | grep "^2:")
+    rootfs_start=$(echo "$rootfs_info" | cut -d: -f2 | tr -d 'B')
+    rootfs_end=$(echo "$rootfs_info" | cut -d: -f3 | tr -d 'B')
+    
+    info "Rootfs 分区: 起始=${rootfs_start}B, 结束=${rootfs_end}B"
+}
+
+setup_loopback() {
+    local img="$1" offset="$2"
+    loopback=$(losetup -f --show -o "$offset" "$img") || die "无法创建 loopback 设备"
+    debug_log "创建 loopback: $loopback (offset=$offset)"
+}
+
+release_loopback() {
+    if [[ -n "${loopback:-}" ]]; then
+        losetup -d "$loopback" 2>/dev/null || true
+        loopback=""
     fi
-fi
+}
 
-# 检查必需工具
-for command in $REQUIRED_TOOLS; do
-    command -v $command >/dev/null 2>&1
-    if (( $? != 0 )); then
-        error $LINENO "$command 未安装"
-        exit 4
+check_filesystem() {
+    info "检查文件系统..."
+    
+    if ! e2fsck -pf "$loopback"; then
+        warn "检测到文件系统错误，尝试修复..."
+        e2fsck -y "$loopback" || {
+            [[ "$repair" == true ]] && e2fsck -fy -b 32768 "$loopback"
+        }
     fi
-done
+    
+    (( $? < 4 )) || die "文件系统修复失败"
+}
 
-# 如果指定了新文件名，则复制镜像
-if [ -n "$2" ]; then
-    f="$2"
-    if [[ -n $ziptool && "${f##*.}" == "${ZIPEXTENSIONS[$ziptool]}" ]]; then
-        f="${f%.*}"
-    fi
-    info "正在复制 $1 到 $f..."
-    cp --reflink=auto --sparse=always "$1" "$f"
-    if (( $? != 0 )); then
-        error $LINENO "无法复制文件..."
-        exit 5
-    fi
-    old_owner=$(stat -c %u:%g "$1")
-    chown "$old_owner" "$f"
-    img="$f"
-fi
+get_fs_info() {
+    local tune_output
+    tune_output=$(tune2fs -l "$loopback") || die "无法读取文件系统信息"
+    
+    block_count=$(echo "$tune_output" | grep '^Block count:' | awk '{print $NF}')
+    block_size=$(echo "$tune_output" | grep '^Block size:' | awk '{print $NF}')
+    
+    debug_log "block_count=$block_count, block_size=$block_size"
+}
 
-# 脚本退出时清理
-trap cleanup EXIT
-
-# 收集信息
-info "正在收集镜像信息"
-beforesize="$(ls -lh "$img" | cut -d ' ' -f 5)"
-parted_output="$(parted -ms "$img" unit B print)"
-rc=$?
-if (( $rc )); then
-    error $LINENO "parted 执行失败，返回码 $rc"
-    info "可能是无效的镜像文件。请手动运行 'parted $img unit B print' 检查"
-    exit 6
-fi
-
-# 获取分区信息 - RDK X5 使用双分区: p1=FAT32(config), p2=ext4(rootfs)
-partcount="$(echo "$parted_output" | tail -n +3 | wc -l)"
-info "检测到 $partcount 个分区"
-
-if (( partcount < 2 )); then
-    error $LINENO "镜像分区数量不正确，RDK X5 镜像应该有 2 个分区"
-    exit 6
-fi
-
-# 获取 rootfs 分区 (第二个分区) 信息
-rootfs_partnum="2"
-rootfs_partinfo="$(echo "$parted_output" | grep "^${rootfs_partnum}:")"
-rootfs_partstart="$(echo "$rootfs_partinfo" | cut -d ':' -f 2 | tr -d 'B')"
-rootfs_partend="$(echo "$rootfs_partinfo" | cut -d ':' -f 3 | tr -d 'B')"
-rootfs_partsize="$(echo "$rootfs_partinfo" | cut -d ':' -f 4 | tr -d 'B')"
-rootfs_parttype="$(echo "$rootfs_partinfo" | cut -d ':' -f 5)"
-
-# 获取 config 分区 (第一个分区) 信息
-config_partnum="1"
-config_partinfo="$(echo "$parted_output" | grep "^${config_partnum}:")"
-config_partstart="$(echo "$config_partinfo" | cut -d ':' -f 2 | tr -d 'B')"
-config_partend="$(echo "$config_partinfo" | cut -d ':' -f 3 | tr -d 'B')"
-
-info "Config 分区 (FAT32): 起始=$config_partstart, 结束=$config_partend"
-info "Rootfs 分区 (ext4): 起始=$rootfs_partstart, 结束=$rootfs_partend"
-
-# 设置 loopback 设备指向 rootfs 分区
-loopback="$(losetup -f --show -o "$rootfs_partstart" "$img")"
-tune2fs_output="$(tune2fs -l "$loopback")"
-rc=$?
-if (( $rc )); then
-    echo "$tune2fs_output"
-    error $LINENO "tune2fs 执行失败。无法压缩此类型的镜像"
-    exit 7
-fi
-
-currentsize="$(echo "$tune2fs_output" | grep '^Block count:' | tr -d ' ' | cut -d ':' -f 2)"
-blocksize="$(echo "$tune2fs_output" | grep '^Block size:' | tr -d ' ' | cut -d ':' -f 2)"
-
-logVariables $LINENO beforesize parted_output rootfs_partnum rootfs_partstart rootfs_parttype tune2fs_output currentsize blocksize
-
-# 设置自动扩展
-if [ "$should_skip_autoexpand" = false ]; then
-    set_autoexpand
-else
-    info "跳过自动扩展设置..."
-fi
-
-# 检查文件系统
-checkFilesystem
-
-if ! minsize=$(resize2fs -P "$loopback"); then
-    rc=$?
-    error $LINENO "resize2fs 执行失败，返回码 $rc"
-    exit 10
-fi
-minsize=$(cut -d ':' -f 2 <<< "$minsize" | tr -d ' ')
-logVariables $LINENO currentsize minsize
-
-if [[ $currentsize -eq $minsize ]]; then
-    info "文件系统已经是最小尺寸，跳过文件系统压缩"
-else
-    # 在文件系统末尾添加一些空闲空间 (减少预留空间以获得更小的镜像)
-    extra_space=$(($currentsize - $minsize))
-    logVariables $LINENO extra_space
-    for space in 2500 500 50; do
-        if [[ $extra_space -gt $space ]]; then
-            minsize=$(($minsize + $space))
+calculate_min_size() {
+    local min_output
+    min_output=$(resize2fs -P "$loopback" 2>&1) || die "无法计算最小文件系统大小"
+    
+    min_blocks=$(echo "$min_output" | grep -o '[0-9]*$')
+    
+    # 添加少量额外空间
+    local extra=$((block_count - min_blocks))
+    for margin in 2500 500 50; do
+        if (( extra > margin )); then
+            min_blocks=$((min_blocks + margin))
             break
         fi
     done
-    logVariables $LINENO minsize
+    
+    debug_log "min_blocks=$min_blocks (原始+余量)"
+}
 
-    # 压缩文件系统
-    info "正在压缩文件系统"
-    if [ -z "${mountdir:-}" ]; then
-        mountdir=$(mktemp -d)
+shrink_filesystem() {
+    if (( block_count == min_blocks )); then
+        info "文件系统已是最小尺寸"
+        return 0
     fi
+    
+    info "压缩文件系统: ${block_count} -> ${min_blocks} 块"
+    resize2fs -p "$loopback" "$min_blocks" || die "文件系统压缩失败"
+    
+    # 清零空闲空间以提高压缩率
+    info "清零空闲空间..."
+    mountdir=$(mktemp -d)
+    mount "$loopback" "$mountdir"
+    dd if=/dev/zero of="$mountdir/.zero" bs=1M 2>/dev/null || true
+    rm -f "$mountdir/.zero"
+    umount "$mountdir"
+    rmdir "$mountdir"
+    mountdir=""
+}
 
-    resize2fs -p "$loopback" $minsize
-    rc=$?
-    if (( $rc )); then
-        error $LINENO "resize2fs 执行失败，返回码 $rc"
-        mount "$loopback" "$mountdir"
-        if [ -f "$mountdir/etc/init.d/x5-autoexpand" ]; then
-            rm -f "$mountdir/etc/init.d/x5-autoexpand"
-            rm -f "$mountdir/etc/rcS.d/S01x5-autoexpand"
-        fi
-        umount "$mountdir"
-        losetup -d "$loopback"
-        exit 12
-    else
-        info "正在清零剩余空闲空间"
-        mount "$loopback" "$mountdir"
-        cat /dev/zero > "$mountdir/X5Shrink_zero_file" 2>/dev/null
-        info "已清零 $(ls -lh "$mountdir/X5Shrink_zero_file" 2>/dev/null | cut -d ' ' -f 5)"
-        rm -f "$mountdir/X5Shrink_zero_file"
-        umount "$mountdir"
-    fi
+shrink_partition() {
+    local new_size=$((min_blocks * block_size))
+    local new_end=$((rootfs_start + new_size))
+    
+    info "压缩分区: 新结束位置=${new_end}B"
+    
+    release_loopback
     sleep 1
+    
+    # 删除并重建分区
+    parted -s -a minimal "$img" rm 2 || die "删除分区失败"
+    parted -s "$img" unit B mkpart primary ext4 "$rootfs_start" "$new_end" || die "创建分区失败"
+    parted -s "$img" set 2 boot on
+    
+    # 验证文件系统
+    setup_loopback "$img" "$rootfs_start"
+    info "验证压缩后的文件系统..."
+    e2fsck -fy "$loopback" || (( $? < 4 )) || die "文件系统验证失败"
+    release_loopback
+}
 
-    # 压缩分区
-    info "正在压缩分区"
-    partnewsize=$(($minsize * $blocksize))
-    newpartend=$(($rootfs_partstart + $partnewsize))
-    logVariables $LINENO partnewsize newpartend
+truncate_image() {
+    local end_pos
+    end_pos=$(parted -ms "$img" unit B print | grep "^2:" | cut -d: -f3 | tr -d 'B')
+    
+    info "截断镜像文件..."
+    truncate -s "$((end_pos + 1))" "$img" || die "截断镜像失败"
+}
 
-    # 释放当前的 loopback 设备
-    losetup -d "$loopback"
-    loopback=""
-    sleep 1
-
-    # 删除旧的 rootfs 分区
-    parted -s -a minimal "$img" rm "$rootfs_partnum"
-    rc=$?
-    if (( $rc )); then
-        error $LINENO "parted 删除分区失败，返回码 $rc"
-        exit 13
+setup_autoexpand() {
+    [[ "$skip_autoexpand" == true ]] && { info "跳过自动扩展设置"; return 0; }
+    
+    info "配置首次启动自动扩展..."
+    
+    setup_loopback "$img" "$rootfs_start"
+    mountdir=$(mktemp -d)
+    
+    if ! mount "$loopback" "$mountdir" 2>/dev/null; then
+        warn "无法挂载 rootfs，跳过自动扩展配置"
+        rmdir "$mountdir"
+        mountdir=""
+        return 0
     fi
-
-    # 创建新的 rootfs 分区
-    parted -s "$img" unit B mkpart primary ext4 "$rootfs_partstart" "$newpartend"
-    rc=$?
-    if (( $rc )); then
-        error $LINENO "parted 创建分区失败，返回码 $rc"
-        exit 14
-    fi
-
-    # 设置启动标志
-    parted -s "$img" set "$rootfs_partnum" boot on
-
-    # 同步分区表更改
-    info "正在同步分区表"
-    partprobe "$img" 2>/dev/null || true
-    sleep 2
-
-    # 重新绑定 loopback 设备到新的 rootfs 分区
-    loopback="$(losetup -f --show -o "$rootfs_partstart" "$img")"
-    if [ -z "$loopback" ]; then
-        error $LINENO "无法重新绑定 loopback 设备"
-        exit 20
-    fi
-
-    # 对压缩后的文件系统进行完整性检查
-    info "正在检查压缩后的文件系统"
-    e2fsck -fy "$loopback"
-    rc=$?
-    if (( $rc > 1 && $rc < 4 )); then
-        info "文件系统检查完成，发现并修复了一些问题"
-    elif (( $rc >= 4 )); then
-        error $LINENO "文件系统检查失败，返回码 $rc"
-        exit 21
-    fi
-
-    # 截断文件
-    info "正在截断镜像文件"
-    parted_output=$(parted -ms "$img" unit B print)
-    rc=$?
-    if (( $rc )); then
-        error $LINENO "parted 执行失败，返回码 $rc"
-        exit 15
-    fi
-
-    # 获取 rootfs 分区 (第2分区) 的结束位置，而不是 free space
-    endresult=$(echo "$parted_output" | grep "^${rootfs_partnum}:" | cut -d ':' -f 3 | tr -d 'B')
-    # 加1字节作为文件大小
-    endresult=$((endresult + 1))
-    logVariables $LINENO endresult
-    truncate -s "$endresult" "$img"
-    rc=$?
-    if (( $rc )); then
-        error $LINENO "truncate 执行失败，返回码 $rc"
-        exit 16
-    fi
-fi
-
-# 释放 loopback 设备
-if [ -n "${loopback:-}" ]; then
-    losetup -d "$loopback" 2>/dev/null
-    loopback=""
-fi
-
-# 最终同步确保所有更改写入磁盘
-sync
-sleep 1
-
-# 处理压缩
-if [[ -n $ziptool ]]; then
-    options=""
-    envVarname="${MYNAME^^}_${ziptool^^}"
-    [[ $parallel == true ]] && options="${ZIP_PARALLEL_OPTIONS[$ziptool]}"
-    [[ -v $envVarname ]] && options="${!envVarname}"
-    [[ $verbose == true ]] && options="$options -v"
-
-    if [[ $parallel == true ]]; then
-        parallel_tool="${ZIP_PARALLEL_TOOL[$ziptool]}"
-        info "使用 $parallel_tool 压缩镜像"
-        if ! $parallel_tool ${options} "$img"; then
-            rc=$?
-            error $LINENO "$parallel_tool 执行失败，返回码 $rc"
-            exit 18
-        fi
+    
+    # 检查是否已有官方的 hobot-resizefs
+    if [[ -f "$mountdir/etc/init.d/hobot-resizefs" ]]; then
+        # 删除扩展完成标记，让 hobot-resizefs 重新执行
+        rm -f "$mountdir/etc/.do_expand_partiton"
+        rm -f "$mountdir/etc/.do_resizefs_rootfs"
+        info "已重置 hobot-resizefs 扩展标记"
     else
-        info "使用 $ziptool 压缩镜像"
-        if ! $ziptool ${options} "$img"; then
-            rc=$?
-            error $LINENO "$ziptool 执行失败，返回码 $rc"
-            exit 19
-        fi
+        # 如果没有官方脚本，安装兼容的扩展脚本
+        install_expand_script "$mountdir"
     fi
-    img=$img.${ZIPEXTENSIONS[$ziptool]}
-fi
+    
+    sync
+    umount "$mountdir"
+    rmdir "$mountdir"
+    mountdir=""
+    release_loopback
+}
 
-aftersize=$(ls -lh "$img" | cut -d ' ' -f 5)
-logVariables $LINENO aftersize
+install_expand_script() {
+    local rootfs="$1"
+    
+    info "安装自动扩展脚本..."
+    
+    cat > "$rootfs/etc/init.d/x5-resizefs" << 'SCRIPT'
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          x5-resizefs
+# Required-Start:    $local_fs
+# Required-Stop:
+# Default-Start:     2 3 4 5
+# Default-Stop:
+# Short-Description: 扩展 RDK X5 rootfs 分区和文件系统
+### END INIT INFO
 
-info "成功将 $img 从 $beforesize 压缩到 $aftersize"
+do_expand() {
+    [[ -f /etc/.x5_expanded ]] && return 0
+    
+    local root_part=$(findmnt / -o source -n)
+    local root_dev="/dev/$(lsblk -no pkname "$root_part")"
+    local part_num=$(echo "$root_part" | grep -o '[0-9]*$')
+    
+    # 检查是否为最后一个分区
+    local last_part=$(parted "$root_dev" -ms unit s p | tail -1 | cut -d: -f1)
+    [[ "$last_part" != "$part_num" ]] && return 0
+    
+    # 获取分区起始扇区
+    local part_start=$(parted "$root_dev" -ms unit s p | grep "^${part_num}:" | cut -d: -f2 | tr -d 's')
+    [[ -z "$part_start" ]] && return 1
+    
+    # 扩展分区
+    fdisk "$root_dev" << EOF
+d
+$part_num
+n
+p
+$part_num
+$part_start
+
+w
+EOF
+    
+    partprobe "$root_dev"
+    parted "$root_dev" set "$part_num" boot on
+    
+    # 扩展文件系统
+    resize2fs "$root_part"
+    
+    touch /etc/.x5_expanded
+    
+    # 清理自身
+    update-rc.d x5-resizefs remove 2>/dev/null || true
+    rm -f /etc/init.d/x5-resizefs /etc/rcS.d/*x5-resizefs
+}
+
+case "$1" in
+    start) do_expand ;;
+    *) echo "Usage: $0 start" ;;
+esac
+SCRIPT
+    
+    chmod +x "$rootfs/etc/init.d/x5-resizefs"
+    ln -sf ../init.d/x5-resizefs "$rootfs/etc/rcS.d/S01x5-resizefs" 2>/dev/null || \
+        chroot "$rootfs" update-rc.d x5-resizefs defaults 2>/dev/null || true
+}
+
+compress_image() {
+    [[ -z "$ziptool" ]] && return 0
+    
+    local tool="${COMPRESS_TOOLS[$ziptool]:-$ziptool}"
+    local opts="${COMPRESS_OPTS[$ziptool]:-}"
+    
+    [[ "$parallel" != true && "$ziptool" == "gzip" ]] && tool="gzip"
+    [[ "$verbose" == true ]] && opts+=" -v"
+    
+    info "使用 $tool 压缩镜像..."
+    $tool $opts "$img" || die "$tool 压缩失败"
+    
+    img="${img}.${COMPRESS_EXT[$ziptool]}"
+}
+
+# ============================================================================
+# 主程序
+# ============================================================================
+main() {
+    trap cleanup EXIT
+    
+    # 解析参数
+    while getopts ":adhrszvZ" opt; do
+        case "$opt" in
+            a) parallel=true ;;
+            d) debug=true ;;
+            h) show_help ;;
+            r) repair=true ;;
+            s) skip_autoexpand=true ;;
+            v) verbose=true ;;
+            z) ziptool="gzip" ;;
+            Z) ziptool="xz" ;;
+            *) show_help ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+    
+    [[ $# -lt 1 ]] && show_help
+    
+    local src="$1"
+    img="$1"
+    
+    [[ -f "$img" ]] || die "文件不存在: $img"
+    
+    echo "X5Shrink $VERSION - RDK X5 镜像压缩工具"
+    echo
+    
+    check_requirements
+    
+    # 设置 POSIX 环境
+    export LC_ALL=POSIX LANG=POSIX
+    
+    # 复制到新文件（如果指定）
+    if [[ -n "${2:-}" ]]; then
+        local dest="$2"
+        [[ -n "$ziptool" && "${dest##*.}" == "${COMPRESS_EXT[$ziptool]}" ]] && dest="${dest%.*}"
+        info "复制镜像到 $dest..."
+        cp --reflink=auto --sparse=always "$src" "$dest"
+        chown --reference="$src" "$dest"
+        img="$dest"
+    fi
+    
+    local before_size=$(stat -c%s "$img")
+    
+    # 执行压缩流程
+    get_partition_info "$img"
+    setup_loopback "$img" "$rootfs_start"
+    get_fs_info
+    setup_autoexpand
+    
+    setup_loopback "$img" "$rootfs_start"
+    check_filesystem
+    calculate_min_size
+    shrink_filesystem
+    shrink_partition
+    truncate_image
+    compress_image
+    
+    local after_size=$(stat -c%s "$img")
+    local saved=$((before_size - after_size))
+    
+    echo
+    info "压缩完成!"
+    info "  原始大小: $(numfmt --to=iec $before_size)"
+    info "  压缩后:   $(numfmt --to=iec $after_size)"
+    info "  节省:     $(numfmt --to=iec $saved) ($(( saved * 100 / before_size ))%)"
+}
+
+main "$@"
