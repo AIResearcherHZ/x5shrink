@@ -337,6 +337,12 @@ x5shrink/
 
 本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件
 
+## 致谢
+
+- 感谢 [PiShrink](https://github.com/Drewsif/PiShrink) 项目提供的灵感和参考
+- 感谢 D-Robotics 团队开发的 RDK X5 开发板
+- 感谢所有贡献者和用户的支持
+
 ## 联系方式
 
 - **作者**: AIResearcherHZ
