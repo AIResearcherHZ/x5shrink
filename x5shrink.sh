@@ -43,9 +43,9 @@ die()     { echo "$SCRIPT_NAME: [错误] $*" >&2; exit 1; }
 debug_log() { [[ "$debug" == true ]] && echo "[DEBUG] $*" >> "${SCRIPT_DIR}/${SCRIPT_NAME%.*}.log"; }
 
 cleanup() {
-    [[ -n "${loopback:-}" ]] && losetup "$loopback" &>/dev/null && losetup -d "$loopback"
     [[ -n "${mountdir:-}" ]] && mountpoint -q "$mountdir" 2>/dev/null && umount "$mountdir"
     [[ -n "${mountdir:-}" ]] && [[ -d "$mountdir" ]] && rmdir "$mountdir" 2>/dev/null
+    [[ -n "${loopback:-}" ]] && losetup "$loopback" &>/dev/null && losetup -d "$loopback"
 }
 
 show_help() {
@@ -178,17 +178,23 @@ shrink_filesystem() {
     # 清零空闲空间以提高压缩率
     info "清零空闲空间..."
     mountdir=$(mktemp -d)
-    mount "$loopback" "$mountdir"
-    dd if=/dev/zero of="$mountdir/.zero" bs=1M 2>/dev/null || true
-    rm -f "$mountdir/.zero"
-    umount "$mountdir"
-    rmdir "$mountdir"
-    mountdir=""
+    if mount "$loopback" "$mountdir"; then
+        dd if=/dev/zero of="$mountdir/.zero" bs=1M 2>/dev/null || true
+        rm -f "$mountdir/.zero"
+        umount "$mountdir"
+        rmdir "$mountdir"
+        mountdir=""
+    else
+        warn "无法挂载 rootfs，跳过清零空闲空间"
+        rmdir "$mountdir"
+        mountdir=""
+    fi
 }
 
 shrink_partition() {
     local new_size=$((min_blocks * block_size))
-    local new_end=$((rootfs_start + new_size))
+    local new_end=$((rootfs_start + new_size - 1))
+    (( new_end > rootfs_start )) || die "计算分区结束位置失败"
     
     info "压缩分区: 新结束位置=${new_end}B"
     
@@ -231,6 +237,7 @@ setup_autoexpand() {
         warn "无法挂载 rootfs，跳过自动扩展配置"
         rmdir "$mountdir"
         mountdir=""
+        release_loopback
         return 0
     fi
     
